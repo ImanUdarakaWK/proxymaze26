@@ -228,7 +228,6 @@ async def send_discord_message(webhook_url: str, username: str, event_type: str,
             {"name": "Alert ID", "value": alert_data["alert_id"], "inline": False},
             {"name": "Failure Rate", "value": str(alert_data["failure_rate"]), "inline": True},
             {"name": "Failed Proxies", "value": str(alert_data["failed_proxies"]), "inline": True},
-            {"name": "Threshold", "value": "0.20", "inline": True},
             {"name": "Failed IDs", "value": ", ".join(alert_data["failed_proxy_ids"]), "inline": False}
         ]
         title = "🔥 Alert Fired"
@@ -252,13 +251,6 @@ async def send_discord_message(webhook_url: str, username: str, event_type: str,
 # ------------------------------------------------------------------
 # 7. Background monitor loop (core logic)
 # ------------------------------------------------------------------
-async def check_single_proxy(client: httpx.AsyncClient, url: str, timeout_sec: float):
-    try:
-        resp = await client.get(url, timeout=timeout_sec)
-        return "up" if 200 <= resp.status_code < 300 else "down"
-    except:
-        return "down"
-
 async def monitor_loop():
     global proxies_db, active_alert_id, alerts_db
     while True:
@@ -287,7 +279,7 @@ async def monitor_loop():
             total = len(proxies_db)
             failure_rate = down_count / total if total > 0 else 0.0
             
-            # Alert Lifecycle
+            # Alert lifecycle
             if failure_rate >= 0.20:
                 if active_alert_id is None:
                     alert_id = str(uuid.uuid4())
@@ -307,7 +299,7 @@ async def monitor_loop():
                     alerts_db.append(alert_obj)
                     print(f"🔥 ALERT FIRED: {alert_id}")
                     
-                    # Send to registered webhooks
+                    # Send webhooks
                     payload = {
                         "event": "alert.fired",
                         "alert_id": alert_id,
@@ -329,6 +321,7 @@ async def monitor_loop():
                     for dc in discord_integrations:
                         if "alert.fired" in dc["events"]:
                             asyncio.create_task(send_discord_message(dc["webhook_url"], dc["username"], "alert.fired", alert_obj))
+                # else: already active, do nothing
             else:
                 if active_alert_id is not None:
                     # Resolve the active alert
@@ -356,8 +349,36 @@ async def monitor_loop():
                             asyncio.create_task(send_discord_message(dc["webhook_url"], dc["username"], "alert.resolved", {"alert_id": active_alert_id}, resolved_at))
                     active_alert_id = None
         
+        else:
+            # ----- NEW: POOL IS EMPTY -----
+            # failure rate is effectively 0.0, so any active alert must be resolved
+            if active_alert_id is not None:
+                # Resolve the alert
+                for alert in alerts_db:
+                    if alert["alert_id"] == active_alert_id:
+                        alert["status"] = "resolved"
+                        resolved_at = datetime.now(timezone.utc).isoformat()
+                        alert["resolved_at"] = resolved_at
+                        break
+                print(f"✅ ALERT RESOLVED (pool empty): {active_alert_id}")
+                # Send resolved webhook
+                payload_resolved = {
+                    "event": "alert.resolved",
+                    "alert_id": active_alert_id,
+                    "resolved_at": resolved_at
+                }
+                for wh in webhooks_db:
+                    asyncio.create_task(send_webhook_with_retry(wh["url"], payload_resolved))
+                # Integrations for resolved
+                for sl in slack_integrations:
+                    if "alert.resolved" in sl["events"]:
+                        asyncio.create_task(send_slack_message(sl["webhook_url"], sl["username"], "alert.resolved", {"alert_id": active_alert_id}, resolved_at))
+                for dc in discord_integrations:
+                    if "alert.resolved" in dc["events"]:
+                        asyncio.create_task(send_discord_message(dc["webhook_url"], dc["username"], "alert.resolved", {"alert_id": active_alert_id}, resolved_at))
+                active_alert_id = None
+        
         await asyncio.sleep(config_data["check_interval_seconds"])
-
 # ------------------------------------------------------------------
 # 8. Metrics endpoint
 # ------------------------------------------------------------------
