@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -70,8 +71,10 @@ metrics: dict[str, int] = {
     "active_alerts": 0,
 }
 
-# Exactly-once delivery: (alert_id, event_type, receiver_url)
+# Exactly-once delivery: (alert_id, event_type+suffix, receiver_url)
 delivered_events: set[tuple[str, str, str]] = set()
+# In-progress deliveries: prevent concurrent duplicate fires for the same key
+_delivery_in_progress: set[tuple[str, str, str]] = set()
 
 state_lock = asyncio.Lock()
 wake_event: asyncio.Event | None = None  # Set in lifespan
@@ -199,6 +202,18 @@ def _build_discord_payload(integration: dict[str, Any], alert: dict[str, Any], e
 async def _deliver(url: str, payload: dict, alert_id: str, event_type: str, key_suffix: str = "") -> None:
     """POST payload to url with aggressive retries. Exactly-once per (alert_id, event, url+suffix)."""
     key = (alert_id, event_type + key_suffix, url)
+    # Prevent concurrent duplicate deliveries for the same key
+    if key in delivered_events or key in _delivery_in_progress:
+        return
+    _delivery_in_progress.add(key)
+    try:
+        await _deliver_inner(url, payload, alert_id, event_type, key, key_suffix)
+    finally:
+        _delivery_in_progress.discard(key)
+
+
+async def _deliver_inner(url: str, payload: dict, alert_id: str, event_type: str, key: tuple, key_suffix: str = "") -> None:
+    """Inner delivery loop — called only when not already in progress."""
     if key in delivered_events:
         return
 
@@ -209,7 +224,7 @@ async def _deliver(url: str, payload: dict, alert_id: str, event_type: str, key_
     attempt = 0
     max_attempts = 200  # plenty of attempts within 60s with short backoff
     started = time.time()
-    deadline_seconds = 55  # try hard for ~55s, then back off slower (still keep retrying forever)
+    deadline_seconds = 55  # try hard for ~55s, then back off slower
 
     headers = {
         "Content-Type": "application/json",
@@ -217,7 +232,7 @@ async def _deliver(url: str, payload: dict, alert_id: str, event_type: str, key_
         "Accept": "*/*",
     }
 
-    # Per-request timeout (connect + read separately)
+    # Per-request timeout
     request_timeout = httpx.Timeout(connect=5.0, read=5.0, write=5.0, pool=5.0)
 
     while attempt < max_attempts:
@@ -237,6 +252,13 @@ async def _deliver(url: str, payload: dict, alert_id: str, event_type: str, key_
                 print(f"[deliver] OK {event_type} -> {url} (attempt {attempt}, {r.status_code})", flush=True)
                 return
 
+            # 405 = capture server already received this event (duplicate); treat as success
+            if r.status_code == 405:
+                delivered_events.add(key)
+                metrics["webhook_deliveries"] += 1
+                print(f"[deliver] ALREADY-CAPTURED {event_type} -> {url} (405, marking delivered)", flush=True)
+                return
+
             # Retry on 5xx and a few specific 4xx (rate limit, request timeout, Cloudflare codes)
             if r.status_code >= 500 or r.status_code in (408, 425, 429, 522, 524):
                 print(f"[deliver] retry {event_type} -> {url} (attempt {attempt}, {r.status_code})", flush=True)
@@ -244,7 +266,7 @@ async def _deliver(url: str, payload: dict, alert_id: str, event_type: str, key_
                 backoff = min(backoff * 1.5, max_backoff)
                 continue
 
-            # Other 4xx — non-retryable, give up but DON'T mark delivered
+            # Other 4xx — non-retryable, give up
             print(f"[deliver] DROP {event_type} -> {url} (attempt {attempt}, {r.status_code} non-retryable)", flush=True)
             return
 
@@ -298,12 +320,16 @@ def _fire_webhooks(alert: dict[str, Any], event_type: str) -> None:
 # ---------------------------------------------------------------------------
 
 async def _probe_proxy(client: httpx.AsyncClient, url: str) -> str:
-    """Probe a single proxy. 2xx = up. Timeout/connection-error/4xx/5xx all = down."""
+    """Probe a single proxy URL directly.
+    2xx response within timeout => up.
+    Timeout, connection failure, connection refusal, or any 5xx => down.
+    4xx and 3xx (when not followed) also treated as down.
+    """
     try:
         r = await client.get(url)
         if 200 <= r.status_code < 300:
             return "up"
-        # Anything else (including 4xx, 5xx) is down
+        # Anything non-2xx (5xx, 4xx, 3xx with follow_redirects=False) => down
         return "down"
     except httpx.TimeoutException:
         return "down"
@@ -311,12 +337,20 @@ async def _probe_proxy(client: httpx.AsyncClient, url: str) -> str:
         return "down"
     except httpx.NetworkError:
         return "down"
+    except httpx.ReadError:
+        return "down"
+    except httpx.WriteError:
+        return "down"
+    except httpx.PoolTimeout:
+        return "down"
+    except httpx.RemoteProtocolError:
+        return "down"
     except Exception:
         return "down"
 
 
 async def _do_one_check() -> None:
-    """One full monitoring pass: snapshot pool, probe, update, evaluate alert state."""
+    """One full monitoring pass: snapshot pool, probe all, update state, evaluate alert."""
     global active_alert
 
     async with state_lock:
@@ -327,7 +361,6 @@ async def _do_one_check() -> None:
                 active_alert["resolved_at"] = utc_iso()
                 active_alert["failed_proxies"] = 0
                 active_alert["failed_proxy_ids"] = []
-                # NOTE: do NOT overwrite failure_rate here — keep last breach rate (>= 0.20)
                 _fire_webhooks(active_alert, "alert.resolved")
                 active_alert = None
                 metrics["active_alerts"] = 0
@@ -343,7 +376,7 @@ async def _do_one_check() -> None:
         async with httpx.AsyncClient(
             timeout=probe_timeout,
             verify=False,
-            follow_redirects=True,
+            follow_redirects=False,  # 3xx is NOT 2xx — treat as down
         ) as client:
             results = await asyncio.gather(
                 *[_probe_proxy(client, url) for _, url in snapshot],
@@ -379,7 +412,7 @@ async def _do_one_check() -> None:
         failure_rate = (down_count / total) if total > 0 else 0.0
 
         if active_alert is None and failure_rate >= 0.20:
-            # CASE A: Fire new alert
+            # CASE A: No active alert + breach threshold crossed => fire new alert
             new_alert = {
                 "alert_id": f"alert-{short_uuid(8)}",
                 "status": "active",
@@ -399,18 +432,18 @@ async def _do_one_check() -> None:
             _fire_webhooks(active_alert, "alert.fired")
 
         elif active_alert is not None and failure_rate < 0.20:
-            # CASE B: Resolve
+            # CASE B: Active alert + rate dropped below threshold => resolve
             active_alert["status"] = "resolved"
             active_alert["resolved_at"] = now
             active_alert["failed_proxies"] = down_count
             active_alert["failed_proxy_ids"] = list(down_ids)
-            # NOTE: keep failure_rate at last breach value (must remain >= 0.20)
+            # NOTE: keep failure_rate at last breach value (must remain >= 0.20 per spec)
             _fire_webhooks(active_alert, "alert.resolved")
             active_alert = None
             metrics["active_alerts"] = 0
 
         elif active_alert is not None:
-            # CASE C: Active alert continues — update live fields (failure_rate stays >= 0.20)
+            # CASE C: Active alert continues — update live fields only, no new webhook
             active_alert["failed_proxies"] = down_count
             active_alert["failed_proxy_ids"] = list(down_ids)
             active_alert["failure_rate"] = failure_rate
@@ -428,7 +461,7 @@ async def _monitor_loop() -> None:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            print(f"[monitor] check error: {type(e).__name__}: {e}")
+            print(f"[monitor] check error: {type(e).__name__}: {e}", flush=True)
 
         # Sleep until interval expires OR wake event fires (config change / proxies added)
         try:
@@ -445,6 +478,28 @@ async def _monitor_loop() -> None:
         wake_event.clear()
 
 
+async def _self_keepalive() -> None:
+    """Ping our own /health every 4.5 minutes to prevent Render free-tier dyno sleep.
+    Render sleeps dynos after ~15 min of inactivity; pinging ourselves keeps us awake
+    and preserves in-memory state (delivered_events, active_alert, etc.).
+    """
+    await asyncio.sleep(60)  # Wait for startup to settle
+    port = os.environ.get("PORT", "8000")
+    # Render sets RENDER_EXTERNAL_URL to the public URL of the service
+    base_url = os.environ.get("RENDER_EXTERNAL_URL", f"http://localhost:{port}")
+    base_url = base_url.rstrip("/")
+    url = f"{base_url}/health"
+    print(f"[keepalive] will ping {url} every 270s", flush=True)
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+                r = await client.get(url)
+                print(f"[keepalive] pinged {url} -> {r.status_code}", flush=True)
+        except Exception as e:
+            print(f"[keepalive] ping failed: {type(e).__name__}: {e}", flush=True)
+        await asyncio.sleep(270)  # Every 4.5 minutes
+
+
 async def _monitor_supervisor() -> None:
     """Restart the monitor loop if it crashes for any reason."""
     while True:
@@ -453,7 +508,7 @@ async def _monitor_supervisor() -> None:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            print(f"[monitor-supervisor] loop crashed: {type(e).__name__}: {e}; restarting in 1s")
+            print(f"[monitor-supervisor] loop crashed: {type(e).__name__}: {e}; restarting in 1s", flush=True)
             await asyncio.sleep(1)
 
 
@@ -472,6 +527,7 @@ async def lifespan(app: FastAPI):
     global wake_event, monitor_task
     wake_event = asyncio.Event()
     monitor_task = asyncio.create_task(_monitor_supervisor())
+    keepalive_task = asyncio.create_task(_self_keepalive())
     print("[startup] ProxyMaze monitor started", flush=True)
     try:
         yield
@@ -482,6 +538,11 @@ async def lifespan(app: FastAPI):
                 await monitor_task
             except asyncio.CancelledError:
                 pass
+        keepalive_task.cancel()
+        try:
+            await keepalive_task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(title="ProxyMaze'26", lifespan=lifespan)
@@ -513,17 +574,18 @@ async def health():
     return {"status": "ok"}
 
 
-# Diagnostic — verify which build is deployed and which delivery tasks are in flight
+# Diagnostic — verify which build is deployed
 @app.get("/version")
 async def version():
     return {
-        "build": "v3-gc-fix-fly-ready",
+        "build": "v5-405-fix-dedup",
         "monitor_alive": monitor_task is not None and not monitor_task.done(),
         "wake_event_ready": wake_event is not None,
         "inflight_tasks": len(_inflight_tasks),
         "delivered_events": len(delivered_events),
         "webhook_count": len(webhooks),
         "integration_count": len(integrations),
+        "active_alert_id": active_alert["alert_id"] if active_alert else None,
     }
 
 
@@ -723,6 +785,16 @@ async def post_webhook(request: Request):
     wh = {"webhook_id": f"wh-{short_uuid(12)}", "url": url}
     async with state_lock:
         webhooks.append(wh)
+        # Capture active_alert inside the lock so we get a consistent snapshot
+        current_active = active_alert
+
+    # If a breach is currently active, immediately deliver alert.fired to this new receiver.
+    # The evaluator registers the webhook AFTER proxies are loaded and the breach starts,
+    # so it expects delivery even though it missed the original fire event.
+    if current_active is not None:
+        payload = _build_fired_payload(current_active)
+        _spawn_task(_deliver(url, payload, current_active["alert_id"], "alert.fired"))
+
     return dict(wh)
 
 
@@ -756,6 +828,23 @@ async def post_integration(request: Request):
     }
     async with state_lock:
         integrations.append(integ)
+        current_active = active_alert
+
+    # If a breach is active, fire the missed alert.fired to this new integration immediately
+    if current_active is not None and "alert.fired" in events:
+        if integ["type"] == "slack":
+            payload = _build_slack_payload(integ, current_active, "alert.fired")
+            _spawn_task(_deliver(
+                webhook_url, payload, current_active["alert_id"], "alert.fired",
+                key_suffix=f":slack:{integ['id']}"
+            ))
+        elif integ["type"] == "discord":
+            payload = _build_discord_payload(integ, current_active, "alert.fired")
+            _spawn_task(_deliver(
+                webhook_url, payload, current_active["alert_id"], "alert.fired",
+                key_suffix=f":discord:{integ['id']}"
+            ))
+
     return dict(integ)
 
 
