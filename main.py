@@ -54,8 +54,8 @@ def extract_proxy_id(url: str) -> str:
 # ---------------------------------------------------------------------------
 
 config: dict[str, Any] = {
-    "check_interval_seconds": 5,
-    "request_timeout_ms": 5000,
+    "check_interval_seconds": 15,
+    "request_timeout_ms": 3000,
 }
 
 proxies: dict[str, dict[str, Any]] = {}
