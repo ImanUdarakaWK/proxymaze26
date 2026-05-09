@@ -472,7 +472,7 @@ async def _monitor_loop() -> None:
     """Wake on event or interval timeout, run one check, repeat. Survives errors."""
     global wake_event
     # First probe almost immediately so newly-added proxies transition fast
-    await asyncio.sleep(0.05)
+    await asyncio.sleep(0.02)
 
     while True:
         try:
@@ -490,10 +490,19 @@ async def _monitor_loop() -> None:
         if interval < 0.1:
             interval = 0.1
 
-        try:
-            await asyncio.wait_for(wake_event.wait(), timeout=interval)
-        except asyncio.TimeoutError:
-            pass
+        # Use shorter sleep intervals to be more responsive to wake events
+        # Check wake_event every 0.5s instead of waiting full interval
+        remaining = interval
+        while remaining > 0:
+            sleep_chunk = min(0.5, remaining)
+            try:
+                await asyncio.wait_for(wake_event.wait(), timeout=sleep_chunk)
+            except asyncio.TimeoutError:
+                pass
+            else:
+                break  # Wake event was set, exit inner loop
+            remaining -= sleep_chunk
+        
         wake_event.clear()
 
 
