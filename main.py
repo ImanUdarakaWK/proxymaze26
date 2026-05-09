@@ -513,6 +513,20 @@ async def health():
     return {"status": "ok"}
 
 
+# Diagnostic — verify which build is deployed and which delivery tasks are in flight
+@app.get("/version")
+async def version():
+    return {
+        "build": "v3-gc-fix-fly-ready",
+        "monitor_alive": monitor_task is not None and not monitor_task.done(),
+        "wake_event_ready": wake_event is not None,
+        "inflight_tasks": len(_inflight_tasks),
+        "delivered_events": len(delivered_events),
+        "webhook_count": len(webhooks),
+        "integration_count": len(integrations),
+    }
+
+
 # Chapter 2
 @app.post("/config")
 async def post_config(request: Request):
