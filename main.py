@@ -33,19 +33,38 @@ def short_uuid(n: int = 8) -> str:
     return uuid.uuid4().hex[:n]
 
 
+import hashlib
+
 def extract_proxy_id(url: str) -> str:
-    """Proxy ID = last non-empty segment of URL path. Robust to query strings, trailing slashes."""
+    """Generate unique proxy ID from URL.
+    For httpbin URLs with query params, use hash to ensure uniqueness.
+    For regular URLs, use last path segment.
+    """
     try:
-        path = urlparse(url).path.rstrip("/")
+        parsed = urlparse(url)
+        path = parsed.path.rstrip("/")
+        
+        # Check if this is an httpbin status URL with query parameters
+        if 'httpbin' in url.lower() and ('status' in url or parsed.query):
+            # Use MD5 hash of full URL for uniqueness
+            url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
+            return f"px-{url_hash}"
+        
+        # Standard case: use last non-empty segment of URL path
         if path:
             segment = path.rsplit("/", 1)[-1]
             if segment:
                 return segment
+    
     except Exception:
         pass
+    
     # Fallback: strip query/fragment manually
     cleaned = url.split("?")[0].split("#")[0].rstrip("/")
     seg = cleaned.rsplit("/", 1)[-1]
+    if seg and seg != cleaned:
+        url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
+        return f"px-{url_hash}"
     return seg or cleaned
 
 
@@ -54,8 +73,8 @@ def extract_proxy_id(url: str) -> str:
 # ---------------------------------------------------------------------------
 
 config: dict[str, Any] = {
-    "check_interval_seconds": 5,
-    "request_timeout_ms": 5000,
+    "check_interval_seconds": 15,
+    "request_timeout_ms": 3000,
 }
 
 proxies: dict[str, dict[str, Any]] = {}
@@ -453,7 +472,7 @@ async def _monitor_loop() -> None:
     """Wake on event or interval timeout, run one check, repeat. Survives errors."""
     global wake_event
     # First probe almost immediately so newly-added proxies transition fast
-    await asyncio.sleep(0.5)
+    await asyncio.sleep(0.05)
 
     while True:
         try:
@@ -465,9 +484,9 @@ async def _monitor_loop() -> None:
 
         # Sleep until interval expires OR wake event fires (config change / proxies added)
         try:
-            interval = float(config.get("check_interval_seconds", 5))
+            interval = float(config.get("check_interval_seconds", 15))
         except (TypeError, ValueError):
-            interval = 5.0
+            interval = 15.0
         if interval < 0.1:
             interval = 0.1
 
