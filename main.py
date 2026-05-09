@@ -67,6 +67,7 @@ delivered_events: set[tuple[str, str, str]] = set()
 
 state_lock = asyncio.Lock()
 monitor_task: asyncio.Task | None = None
+pool_dirty: bool = False  # set True when proxies added; triggers immediate check
 
 
 # ---------------------------------------------------------------------------
@@ -244,14 +245,18 @@ async def _probe_proxy(url: str, timeout_ms: int) -> str:
 
 
 async def _monitor_loop() -> None:
-    global active_alert
+    global active_alert, pool_dirty
 
     while True:
         # Sleep in small increments so config changes apply quickly
+        # Skip sleep if pool_dirty (new proxies just added)
         elapsed = 0.0
         while elapsed < config["check_interval_seconds"]:
             await asyncio.sleep(0.5)
             elapsed += 0.5
+            if pool_dirty:
+                break  # run check immediately for new proxies
+        pool_dirty = False
 
         async with state_lock:
             if not proxies:
@@ -259,9 +264,7 @@ async def _monitor_loop() -> None:
                 if active_alert is not None:
                     active_alert["status"] = "resolved"
                     active_alert["resolved_at"] = utc_iso()
-                    active_alert["failure_rate"] = 0.0
-                    active_alert["failed_proxies"] = 0
-                    active_alert["failed_proxy_ids"] = []
+                    # Preserve fire-time failure_rate / failed_proxies / failed_proxy_ids
                     _fire_webhooks(active_alert, "alert.resolved")
                     active_alert = None
                     metrics["active_alerts"] = 0
@@ -321,12 +324,11 @@ async def _monitor_loop() -> None:
                 _fire_webhooks(active_alert, "alert.fired")
 
             elif active_alert is not None and failure_rate < 0.20:
-                # CASE B: Resolve
+                # CASE B: Resolve — preserve fire-time fields, only add resolved_at
                 active_alert["status"] = "resolved"
                 active_alert["resolved_at"] = now
-                active_alert["failed_proxies"] = down_count
-                active_alert["failed_proxy_ids"] = down_ids
-                active_alert["failure_rate"] = failure_rate
+                # Do NOT overwrite failure_rate, failed_proxies, failed_proxy_ids —
+                # they must reflect the values at fire time per the spec.
                 _fire_webhooks(active_alert, "alert.resolved")
                 active_alert = None
                 metrics["active_alerts"] = 0
@@ -401,6 +403,7 @@ async def post_proxies(request: Request):
     urls = body.get("proxies", [])
     replace = body.get("replace", False)
 
+    global pool_dirty
     async with state_lock:
         if replace:
             proxies.clear()
@@ -420,6 +423,8 @@ async def post_proxies(request: Request):
             }
             proxies[pid] = p
             new_proxies.append({"id": pid, "url": url, "status": "pending"})
+        if new_proxies:
+            pool_dirty = True
 
     return {"accepted": len(new_proxies), "proxies": new_proxies}
 
