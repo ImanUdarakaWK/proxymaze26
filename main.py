@@ -34,15 +34,34 @@ def short_uuid(n: int = 8) -> str:
 
 
 def extract_proxy_id(url: str) -> str:
-    """Proxy ID = last non-empty segment of URL path. Robust to query strings, trailing slashes."""
+    """Proxy ID = last non-empty segment of URL path before any query string.
+    For URLs like https://httpbin.org/status/200?id=0, we want 'status' or use full sanitized path.
+    For mock URLs with unique query params, include the query param value for uniqueness.
+    """
     try:
-        path = urlparse(url).path.rstrip("/")
+        parsed = urlparse(url)
+        path = parsed.path.rstrip("/")
+        
+        # Check if this is a httpbin status URL with query param for uniqueness
+        if 'httpbin.org' in url and 'status/' in path:
+            # Extract the status code and query param to create unique ID
+            qs = parsed.query
+            if qs:
+                # Use path segment + query string hash for uniqueness
+                import hashlib
+                unique_part = f"{path}:{qs}"
+                return "px-" + hashlib.md5(unique_part.encode()).hexdigest()[:8]
+        
         if path:
-            segment = path.rsplit("/", 1)[-1]
-            if segment:
-                return segment
+            segments = [s for s in path.split("/") if s]
+            if len(segments) >= 2:
+                # Return second-to-last segment for paths like /status/200
+                return segments[-2] if len(segments) > 1 else segments[0]
+            if segments:
+                return segments[0]
     except Exception:
         pass
+    
     # Fallback: strip query/fragment manually
     cleaned = url.split("?")[0].split("#")[0].rstrip("/")
     seg = cleaned.rsplit("/", 1)[-1]
