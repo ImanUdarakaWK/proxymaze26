@@ -77,6 +77,20 @@ state_lock = asyncio.Lock()
 wake_event: asyncio.Event | None = None  # Set in lifespan
 monitor_task: asyncio.Task | None = None
 
+# CRITICAL: keep strong references to all in-flight delivery tasks.
+# asyncio.create_task() returns a task that the event loop tracks only via
+# weak refs. Without a strong ref here, GC can kill webhook delivery tasks
+# mid-flight (especially on memory-constrained hosts like Render free tier).
+_inflight_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_task(coro) -> asyncio.Task:
+    """Schedule a coroutine in the background, holding a strong ref so GC can't kill it."""
+    task = asyncio.create_task(coro)
+    _inflight_tasks.add(task)
+    task.add_done_callback(_inflight_tasks.discard)
+    return task
+
 
 # ---------------------------------------------------------------------------
 # Webhook payload builders
@@ -260,7 +274,7 @@ def _fire_webhooks(alert: dict[str, Any], event_type: str) -> None:
 
     # Generic webhooks
     for wh in list(webhooks):
-        asyncio.create_task(_deliver(wh["url"], generic_payload, alert_id, event_type))
+        _spawn_task(_deliver(wh["url"], generic_payload, alert_id, event_type))
 
     # Slack/Discord integrations
     for integ in list(integrations):
@@ -269,12 +283,12 @@ def _fire_webhooks(alert: dict[str, Any], event_type: str) -> None:
             continue
         if integ["type"] == "slack":
             payload = _build_slack_payload(integ, alert, event_type)
-            asyncio.create_task(
+            _spawn_task(
                 _deliver(integ["webhook_url"], payload, alert_id, event_type, key_suffix=f":slack:{integ['id']}")
             )
         elif integ["type"] == "discord":
             payload = _build_discord_payload(integ, alert, event_type)
-            asyncio.create_task(
+            _spawn_task(
                 _deliver(integ["webhook_url"], payload, alert_id, event_type, key_suffix=f":discord:{integ['id']}")
             )
 
@@ -458,6 +472,7 @@ async def lifespan(app: FastAPI):
     global wake_event, monitor_task
     wake_event = asyncio.Event()
     monitor_task = asyncio.create_task(_monitor_supervisor())
+    print("[startup] ProxyMaze monitor started", flush=True)
     try:
         yield
     finally:
@@ -470,6 +485,22 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="ProxyMaze'26", lifespan=lifespan)
+
+
+def _ensure_initialized():
+    """Self-heal: if lifespan didn't run for some reason, init on first request."""
+    global wake_event, monitor_task
+    if wake_event is None:
+        wake_event = asyncio.Event()
+    if monitor_task is None or monitor_task.done():
+        monitor_task = asyncio.create_task(_monitor_supervisor())
+        print("[self-init] monitor restarted from request handler", flush=True)
+
+
+@app.middleware("http")
+async def ensure_init_middleware(request: Request, call_next):
+    _ensure_initialized()
+    return await call_next(request)
 
 
 # ---------------------------------------------------------------------------
