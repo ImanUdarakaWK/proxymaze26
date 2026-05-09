@@ -183,41 +183,70 @@ def _build_discord_payload(integration: dict[str, Any], alert: dict[str, Any], e
 # ---------------------------------------------------------------------------
 
 async def _deliver(url: str, payload: dict, alert_id: str, event_type: str, key_suffix: str = "") -> None:
-    """POST payload to url with retries. Exactly-once per (alert_id, event, url+suffix)."""
+    """POST payload to url with aggressive retries. Exactly-once per (alert_id, event, url+suffix)."""
     key = (alert_id, event_type + key_suffix, url)
     if key in delivered_events:
         return
 
-    backoff = 1.0
-    max_backoff = 15.0
+    # Aggressive retry strategy: short backoff, fast retries, fits well within 60s window
+    # Backoff sequence: 0.3, 0.5, 0.8, 1.2, 1.8, 2.5, 3.5, 5.0 (cap)
+    backoff = 0.3
+    max_backoff = 5.0
     attempt = 0
-    max_attempts = 50  # ~hours of retries with capped backoff
+    max_attempts = 200  # plenty of attempts within 60s with short backoff
+    started = time.time()
+    deadline_seconds = 55  # try hard for ~55s, then back off slower (still keep retrying forever)
+
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "ProxyMaze/1.0 (+https://proxymaze26)",
+        "Accept": "*/*",
+    }
+
+    # Per-request timeout (connect + read separately)
+    request_timeout = httpx.Timeout(connect=5.0, read=5.0, write=5.0, pool=5.0)
 
     while attempt < max_attempts:
         attempt += 1
         try:
-            async with httpx.AsyncClient(timeout=15.0, verify=False) as client:
-                r = await client.post(
-                    url,
-                    json=payload,
-                    headers={"Content-Type": "application/json"},
-                )
+            async with httpx.AsyncClient(
+                timeout=request_timeout,
+                verify=False,
+                follow_redirects=True,
+                http2=False,
+            ) as client:
+                r = await client.post(url, json=payload, headers=headers)
+
             if 200 <= r.status_code < 300:
                 delivered_events.add(key)
                 metrics["webhook_deliveries"] += 1
+                print(f"[deliver] OK {event_type} -> {url} (attempt {attempt}, {r.status_code})", flush=True)
                 return
-            if r.status_code in (500, 502, 503, 504, 408, 429, 522, 524):
+
+            # Retry on 5xx and a few specific 4xx (rate limit, request timeout, Cloudflare codes)
+            if r.status_code >= 500 or r.status_code in (408, 425, 429, 522, 524):
+                print(f"[deliver] retry {event_type} -> {url} (attempt {attempt}, {r.status_code})", flush=True)
                 await asyncio.sleep(backoff)
-                backoff = min(backoff * 1.7, max_backoff)
+                backoff = min(backoff * 1.5, max_backoff)
                 continue
+
             # Other 4xx — non-retryable, give up but DON'T mark delivered
+            print(f"[deliver] DROP {event_type} -> {url} (attempt {attempt}, {r.status_code} non-retryable)", flush=True)
             return
-        except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError, httpx.ReadError):
+
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError,
+                httpx.ReadError, httpx.WriteError, httpx.NetworkError) as e:
+            print(f"[deliver] network err {event_type} -> {url} (attempt {attempt}, {type(e).__name__})", flush=True)
             await asyncio.sleep(backoff)
-            backoff = min(backoff * 1.7, max_backoff)
-        except Exception:
+            backoff = min(backoff * 1.5, max_backoff)
+        except Exception as e:
+            print(f"[deliver] error {event_type} -> {url} (attempt {attempt}, {type(e).__name__}: {e})", flush=True)
             await asyncio.sleep(backoff)
-            backoff = min(backoff * 1.7, max_backoff)
+            backoff = min(backoff * 1.5, max_backoff)
+
+        # After deadline_seconds, slow down to once-per-30s to avoid burning resources
+        if time.time() - started > deadline_seconds:
+            await asyncio.sleep(30.0)
 
 
 def _fire_webhooks(alert: dict[str, Any], event_type: str) -> None:
@@ -255,11 +284,18 @@ def _fire_webhooks(alert: dict[str, Any], event_type: str) -> None:
 # ---------------------------------------------------------------------------
 
 async def _probe_proxy(client: httpx.AsyncClient, url: str) -> str:
-    """Probe a single proxy. 2xx = up, anything else (incl. timeout/conn-err/5xx) = down."""
+    """Probe a single proxy. 2xx = up. Timeout/connection-error/4xx/5xx all = down."""
     try:
         r = await client.get(url)
         if 200 <= r.status_code < 300:
             return "up"
+        # Anything else (including 4xx, 5xx) is down
+        return "down"
+    except httpx.TimeoutException:
+        return "down"
+    except httpx.ConnectError:
+        return "down"
+    except httpx.NetworkError:
         return "down"
     except Exception:
         return "down"
@@ -286,10 +322,15 @@ async def _do_one_check() -> None:
         snapshot = [(pid, p["url"]) for pid, p in proxies.items()]
         timeout_ms = int(config.get("request_timeout_ms", 5000))
 
-    # Probe outside lock
+    # Probe outside lock with explicit connect/read timeouts
     timeout_s = max(0.1, timeout_ms / 1000.0)
+    probe_timeout = httpx.Timeout(connect=timeout_s, read=timeout_s, write=timeout_s, pool=timeout_s)
     try:
-        async with httpx.AsyncClient(timeout=timeout_s, verify=False, follow_redirects=True) as client:
+        async with httpx.AsyncClient(
+            timeout=probe_timeout,
+            verify=False,
+            follow_redirects=True,
+        ) as client:
             results = await asyncio.gather(
                 *[_probe_proxy(client, url) for _, url in snapshot],
                 return_exceptions=False,
