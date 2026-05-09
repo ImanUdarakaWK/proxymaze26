@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import ast; ast.parse\\(open\\('main.py'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
+      "Bash(pip install:*)",
+      "Bash(python -c \"from main import app; print\\('App loaded OK, routes:', [r.path for r in app.routes if hasattr\\(r, 'path'\\)]\\)\")"
+    ]
+  }
+}
