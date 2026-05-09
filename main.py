@@ -471,28 +471,25 @@ async def _do_one_check() -> None:
 async def _monitor_loop() -> None:
     """Wake on event or interval timeout, run one check, repeat. Survives errors."""
     global wake_event
-    # First probe almost immediately so newly-added proxies transition fast
-    await asyncio.sleep(0.02)
-
+    
+    # Run initial check IMMEDIATELY on startup (no sleep) so service is ready instantly
+    try:
+        await _do_one_check()
+    except Exception as e:
+        print(f"[monitor] initial check error: {type(e).__name__}: {e}", flush=True)
+    
     while True:
         try:
-            await _do_one_check()
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            print(f"[monitor] check error: {type(e).__name__}: {e}", flush=True)
-
-        # Sleep until interval expires OR wake event fires (config change / proxies added)
-        try:
+            # Wait for wake event OR interval timeout
             interval = float(config.get("check_interval_seconds", 15))
         except (TypeError, ValueError):
             interval = 15.0
         if interval < 0.1:
             interval = 0.1
-
-        # Use shorter sleep intervals to be more responsive to wake events
-        # Check wake_event every 0.5s instead of waiting full interval
+        
+        # Sleep in chunks to be responsive to wake events
         remaining = interval
+        woke_early = False
         while remaining > 0:
             sleep_chunk = min(0.5, remaining)
             try:
@@ -500,10 +497,19 @@ async def _monitor_loop() -> None:
             except asyncio.TimeoutError:
                 pass
             else:
+                woke_early = True
                 break  # Wake event was set, exit inner loop
             remaining -= sleep_chunk
         
         wake_event.clear()
+        
+        # Run the check
+        try:
+            await _do_one_check()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[monitor] check error: {type(e).__name__}: {e}", flush=True)
 
 
 async def _self_keepalive() -> None:
